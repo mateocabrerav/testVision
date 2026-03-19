@@ -178,7 +178,7 @@ def run_tracker():
             tracker = SelectivePersonTracker(
                 model_path='yolov8n.pt',
                 training_set_dir='training_set/output',
-                match_threshold=0.80,
+                match_threshold=0.75,
                 device=get_best_device(),
                 img_size=(416, 416),
                 skip_frames=2,

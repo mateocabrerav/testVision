@@ -274,12 +274,11 @@ class SelectivePersonTracker:
 
     def _compute_histogram_features(self, img: np.ndarray) -> np.ndarray:
         """Compute color histogram features for matching."""
-        # Crop to the center to remove heavy background influence from bounding boxes
+        # Mild crop to remove the absolute edges (like background walls or floor)
         h, w = img.shape[:2]
-        if h > 10 and w > 10:  # Ensure we have enough pixels to crop
-            # Take the center 60% of the image horizontally and 80% vertically
-            # People tend to be in the center of the bounding box
-            img = img[int(h*0.1):int(h*0.9), int(w*0.2):int(w*0.8)]
+        if h > 10 and w > 10:
+            # Keep 80% of width, 90% of height (centered)
+            img = img[int(h*0.05):int(h*0.95), int(w*0.1):int(w*0.9)]
 
         # Resize for faster processing
         img_resized = cv2.resize(img, (64, 64))
@@ -287,15 +286,22 @@ class SelectivePersonTracker:
         # Convert to HSV for better color representation
         hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
         
-        # Compute histograms with reduced bins for speed
-        hist_h = cv2.calcHist([hsv], [0], None, [30], [0, 180])
-        hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256])
-        hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256])
+        # Compute a 2D Hue-Saturation joint histogram for strict color-pairing structure
+        # This is MUCH more accurate than separate 1D histograms
+        hist_hs = cv2.calcHist(
+            [hsv], 
+            [0, 1], # Channels: Hue, Saturation
+            None, 
+            [30, 32], # Bins: 30 for Hue, 32 for Saturation
+            [0, 180, 0, 256] # Ranges
+        )
+        
+        # Add a small 1D Value (brightness) histogram to catch extreme dark/light
+        hist_v = cv2.calcHist([hsv], [2], None, [16], [0, 256])
         
         # Normalize and concatenate
         hist = np.concatenate([
-            cv2.normalize(hist_h, hist_h).flatten(),
-            cv2.normalize(hist_s, hist_s).flatten(),
+            cv2.normalize(hist_hs, hist_hs).flatten(),
             cv2.normalize(hist_v, hist_v).flatten()
         ])
         
@@ -320,12 +326,13 @@ class SelectivePersonTracker:
             )
             max_similarity = max(max_similarity, similarity)
         
-        # Cache result using an Exponential Moving Average to prevent flickering
-        # and allow subjects to update their score as they turn or move.
+        # Cache result 
+        # Instead of dampening, we remember the MAXIMUM confident score recently seen for this ID,
+        # but apply a small decay per-frame so if a different person steals the track ID, it fades.
         if track_id is not None:
             if track_id in self.feature_cache:
-                # 80% old score, 20% new score (smooth transitions)
-                max_similarity = 0.8 * self.feature_cache[track_id] + 0.2 * max_similarity
+                # Retain the highest score recently seen, decaying 5% per frame
+                max_similarity = max(max_similarity, self.feature_cache[track_id] * 0.95)
             self.feature_cache[track_id] = max_similarity
         
         return max_similarity
@@ -725,8 +732,7 @@ class SelectivePersonTracker:
 
                                 # Store best match for auto-improvement
                                 if self.auto_improve and self.training_image_count < self.max_training_images:
-                                    if best_match_crop is None or similarity > 0.8:
-                                        best_match_crop = obj['crop']
+                                    best_match_crop = obj['crop']
 
                                 class_name = self.model.names[cls_id] if cls_id is not None else "object"
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3) # Thicker green box for target
