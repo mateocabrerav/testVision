@@ -122,7 +122,7 @@ class SelectivePersonTracker:
         self.reference_features = self._load_training_set_features(self.training_set_dir)
         self.training_image_count = len(self.reference_features)
         self.feature_cache.clear()
-        log.info(f"Reloaded {self.training_image_count} reference images")
+        log.info(f"Reloaded {self.training_image_count} reference images | mean_ref={'yes' if self.mean_reference is not None else 'no'}")
     
     def restart_auto_improvement(self, instruction: str = None):
         """Restart auto-improvement process from scratch."""
@@ -269,72 +269,66 @@ class SelectivePersonTracker:
                 features.append(hist)
             else:
                 log.warning(f"Failed to read image: {img_file}")
-        
+
+        # Pre-compute mean reference for fast O(1) quick-reject
+        if features:
+            self.mean_reference = np.mean(features, axis=0).astype(np.float32)
+        else:
+            self.mean_reference = None
+
         return features
 
     def _compute_histogram_features(self, img: np.ndarray) -> np.ndarray:
-        """Compute color histogram features for matching."""
-        # Mild crop to remove the absolute edges (like background walls or floor)
+        """Compute spatial color histogram (upper/lower body split)."""
         h, w = img.shape[:2]
         if h > 10 and w > 10:
-            # Keep 80% of width, 90% of height (centered)
             img = img[int(h*0.05):int(h*0.95), int(w*0.1):int(w*0.9)]
 
-        # Resize for faster processing
-        img_resized = cv2.resize(img, (64, 64))
-        
-        # Convert to HSV for better color representation
+        img_resized = cv2.resize(img, (64, 128))
         hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
-        
-        # Compute a 2D Hue-Saturation joint histogram for strict color-pairing structure
-        # This is MUCH more accurate than separate 1D histograms
-        hist_hs = cv2.calcHist(
-            [hsv], 
-            [0, 1], # Channels: Hue, Saturation
-            None, 
-            [30, 32], # Bins: 30 for Hue, 32 for Saturation
-            [0, 180, 0, 256] # Ranges
-        )
-        
-        # Add a small 1D Value (brightness) histogram to catch extreme dark/light
-        hist_v = cv2.calcHist([hsv], [2], None, [16], [0, 256])
-        
-        # Normalize and concatenate
-        hist = np.concatenate([
-            cv2.normalize(hist_hs, hist_hs).flatten(),
-            cv2.normalize(hist_v, hist_v).flatten()
-        ])
-        
-        return hist
+
+        # Split into upper body (shirt) and lower body (pants)
+        mid = hsv.shape[0] // 2
+        parts = []
+        for region in (hsv[:mid], hsv[mid:]):
+            hist_hs = cv2.calcHist([region], [0, 1], None, [16, 16], [0, 180, 0, 256])
+            cv2.normalize(hist_hs, hist_hs)
+            parts.append(hist_hs.flatten())
+
+        return np.concatenate(parts)
 
     def _matches_training_set(self, person_crop: np.ndarray, track_id: int = None) -> float:
-        """Check if person matches any image in training set."""
+        """Two-stage matching: quick-reject via mean reference, then full comparison."""
         if len(self.reference_features) == 0:
             return 0.0
-        
-        # Compute features for the detected person
-        person_hist = self._compute_histogram_features(person_crop)
-        
-        # Compare with all reference images
+
+        person_hist = self._compute_histogram_features(person_crop).astype(np.float32)
+
+        # Stage 1: Quick-reject against the pre-computed mean reference (O(1))
+        if self.mean_reference is not None:
+            mean_sim = cv2.compareHist(person_hist, self.mean_reference, cv2.HISTCMP_CORREL)
+            if mean_sim < self.match_threshold - 0.15:
+                # Clearly not the target — skip expensive full comparison
+                if track_id is not None:
+                    self.feature_cache[track_id] = mean_sim
+                return mean_sim
+
+        # Stage 2: Full comparison against all reference images
         max_similarity = 0.0
         for ref_hist in self.reference_features:
-            # Compute correlation similarity (0 to 1)
             similarity = cv2.compareHist(
-                person_hist.astype(np.float32),
+                person_hist,
                 ref_hist.astype(np.float32),
                 cv2.HISTCMP_CORREL
             )
             max_similarity = max(max_similarity, similarity)
-        
-        # Cache result 
-        # Instead of dampening, we remember the MAXIMUM confident score recently seen for this ID,
-        # but apply a small decay per-frame so if a different person steals the track ID, it fades.
+
+        # Cache with decay to allow ID recovery
         if track_id is not None:
             if track_id in self.feature_cache:
-                # Retain the highest score recently seen, decaying 5% per frame
                 max_similarity = max(max_similarity, self.feature_cache[track_id] * 0.95)
             self.feature_cache[track_id] = max_similarity
-        
+
         return max_similarity
 
     def create_result_file(self) -> str:
@@ -608,8 +602,8 @@ class SelectivePersonTracker:
                 try:
                     ret, frame = camera.read()
 
-                    # Very basic alive log
-                    if time.time() - last_test_log > 1.0:
+                    # Periodic alive log (every 30s to reduce I/O overhead)
+                    if time.time() - last_test_log > 30.0:
                         log.info(f"[debug-loop] Thread alive at frame_idx {frame_idx} | has_frame={ret}")
                         last_test_log = time.time()
 
