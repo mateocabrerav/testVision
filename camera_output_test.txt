@@ -1,0 +1,3 @@
+[ WARN:0@10.067] global cap_v4l.cpp:1049 tryIoctl VIDEOIO(V4L2:/dev/video2): select() timeout.
+Trying cv2 V4L2 fallback directly. CV2=4.13.0
+video2 ret=False, type=<class 'NoneType'>

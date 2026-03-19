@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Firebase credentials (NEVER commit these!)
+firebase_credentials.json
+*-firebase-adminsdk-*.json
+
+# Training set outputs (generated data)
+src/training_set/output/
+training_set/output/
+
+# Tracker results
+results/
+
+# Screenshots
+temp_screenshots/
+
+# Test outputs
+test/gemini/output_*.png
+test/trainig_test/output_*.png
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyCharm
+.idea/
+yolov8n.pt
