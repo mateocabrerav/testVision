@@ -651,9 +651,9 @@ class SelectivePersonTracker:
                         boxes = result.boxes
                         has_boxes = boxes is not None and len(boxes) > 0
 
+                    detected_objects = []
                     if has_boxes:
                         # 1. First pass to find the absolute best matched object
-                        detected_objects = []
                         best_sim = -1.0
                         best_obj_idx = -1
 
@@ -685,6 +685,8 @@ class SelectivePersonTracker:
                             frame_area = width * height
                             area_pct = (box_area / frame_area) * 100
                             
+                            bbox_h = y2 - y1
+                            distance_m = round((1.7 * 617.7) / bbox_h, 2) if bbox_h > 0 else 0.0
                             obj_data = {
                                 'box': (x1, y1, x2, y2),
                                 'track_id': track_id,
@@ -692,7 +694,8 @@ class SelectivePersonTracker:
                                 'x_pct': x_pct,
                                 'area_pct': area_pct,
                                 'cls_id': cls_id,
-                                'crop': person_crop.copy()
+                                'crop': person_crop.copy(),
+                                'distance_m': distance_m,
                             }
                             detected_objects.append(obj_data)
 
@@ -728,15 +731,27 @@ class SelectivePersonTracker:
                                 if self.auto_improve and self.training_image_count < self.max_training_images:
                                     best_match_crop = obj['crop']
 
+                                distance_m = obj.get('distance_m', 0.0)
                                 class_name = self.model.names[cls_id] if cls_id is not None else "object"
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3) # Thicker green box for target
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
                                 label = f"TARGET ID:{track_id} ({similarity:.2f})"
                                 cv2.putText(frame, label, (x1, y1 - 10),
                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                # Distance painted inside the bounding box
+                                dist_label = f"{distance_m:.1f} m"
+                                (tw, th), _ = cv2.getTextSize(dist_label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+                                cx_box = (x1 + x2) // 2
+                                cy_box = (y1 + y2) // 2
+                                cv2.putText(frame, dist_label,
+                                            (cx_box - tw // 2, cy_box + th // 2),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
+                                cv2.putText(frame, dist_label,
+                                            (cx_box - tw // 2, cy_box + th // 2),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
                                 best_similarity_for_overlay = similarity
-                                overlay_info = f"Target: X:{x_pct:.0f}% Area:{area_pct:.0f}%"
-                                best_match_data = (x_pct, area_pct)
+                                overlay_info = f"Target: X:{x_pct:.0f}% Area:{area_pct:.0f}% Dist:{distance_m:.1f}m"
+                                best_match_data = (x_pct, area_pct, distance_m)
                             else:
                                 class_name = self.model.names[cls_id] if cls_id is not None else "object"
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 1) # Thin red box for non-targets
@@ -808,10 +823,12 @@ class SelectivePersonTracker:
                     cv2.putText(frame, info_text_2, (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
-                    last_annotated_frame = frame
+                    depth_viz = self._make_depth_viz(frame, detected_objects)
+                    combined = np.hstack([frame, depth_viz])
+                    last_annotated_frame = combined
 
                     if show:
-                        cv2.imshow("Selective Object Tracker", frame)
+                        cv2.imshow("Selective Object Tracker", combined)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             break
 
@@ -831,6 +848,53 @@ class SelectivePersonTracker:
 
             log.info(summary)
     
+    def _make_depth_viz(self, frame: np.ndarray, detected_objects: list) -> np.ndarray:
+        """Full-frame depth heat map: JET base from grayscale + distance-colored boxes."""
+        MAX_DIST = 8.0  # metres
+        h, w = frame.shape[:2]
+
+        # Build a per-pixel depth map (uint8 0-255); default = far (0 = dark blue in JET)
+        depth_map = np.zeros((h, w), dtype=np.uint8)
+        for obj in detected_objects:
+            x1, y1, x2, y2 = obj['box']
+            d = obj.get('distance_m', 0.0)
+            # Close = 255 (red/yellow), far = 0 (blue); cap at MAX_DIST
+            val = int(max(0.0, 1.0 - d / MAX_DIST) * 255) if d > 0 else 0
+            depth_map[y1:y2, x1:x2] = val
+
+        # Apply JET colormap → full color heat map
+        heat = cv2.applyColorMap(depth_map, cv2.COLORMAP_JET)
+
+        # Blend with dimmed grayscale so the scene is still recognisable
+        gray_bgr = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+        viz = cv2.addWeighted(heat, 0.75, gray_bgr, 0.25, 0)
+
+        # Distance label centred inside each detected box
+        for obj in detected_objects:
+            x1, y1, x2, y2 = obj['box']
+            d = obj.get('distance_m', 0.0)
+            if d <= 0:
+                continue
+            txt = f"{d:.1f}m"
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            tx = (x1 + x2) // 2 - tw // 2
+            ty = (y1 + y2) // 2 + th // 2
+            cv2.putText(viz, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
+            cv2.putText(viz, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # Colorbar legend (right side, 20 px wide)
+        bar_w, bar_x = 20, w - 25
+        for row in range(h):
+            t = row / h  # 0=top=far=blue, 1=bottom=close=red
+            val = np.array([[[int((1 - t) * 255)]]], dtype=np.uint8)
+            color = tuple(int(c) for c in cv2.applyColorMap(val, cv2.COLORMAP_JET)[0, 0])
+            cv2.line(viz, (bar_x, row), (bar_x + bar_w, row), color, 1)
+        cv2.putText(viz, "0m", (bar_x - 2, h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.putText(viz, f"{int(MAX_DIST)}m", (bar_x - 2, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        cv2.putText(viz, "Depth map (est.)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        return viz
+
     def _async_improve(self, frame, instruction, best_match_crop):
         """Run auto-improvement in background thread."""
         self.is_improving = True

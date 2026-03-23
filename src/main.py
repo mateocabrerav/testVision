@@ -181,7 +181,7 @@ def run_tracker():
                 match_threshold=0.70,
                 device=get_best_device(),
                 img_size=(320, 320),
-                skip_frames=3,
+                skip_frames=1,
                 conf=0.50,
                 auto_improve=True,
                 max_training_images=200,
