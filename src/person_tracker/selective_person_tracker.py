@@ -703,7 +703,12 @@ class SelectivePersonTracker:
                             area_pct = (box_area / frame_area) * 100
                             
                             bbox_h = y2 - y1
-                            distance_m = round((1.7 * 617.7) / bbox_h, 2) if bbox_h > 0 else 0.0
+                            if hasattr(camera, 'get_distance_at'):
+                                distance_m = camera.get_distance_at(cx, cy)
+                                if distance_m <= 0 and bbox_h > 0:
+                                    distance_m = round((1.7 * 617.7) / bbox_h, 2)
+                            else:
+                                distance_m = round((1.7 * 617.7) / bbox_h, 2) if bbox_h > 0 else 0.0
                             obj_data = {
                                 'box': (x1, y1, x2, y2),
                                 'track_id': track_id,

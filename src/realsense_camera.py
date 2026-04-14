@@ -12,20 +12,73 @@ class OpenCVCamera:
 
     On Jetson (L4T), the uvcvideo kernel driver owns the RealSense, so
     pyrealsense2 cannot open it.  We use plain V4L2 via OpenCV instead.
+    Optionally opens the depth V4L2 node for real depth measurements.
     """
 
-    def __init__(self, device_index: int, width: int = 640, height: int = 480, fps: int = 30):
+    def __init__(self, device_index: int, depth_index: int | None = None,
+                 width: int = 640, height: int = 480, fps: int = 30):
         self.cap = cv2.VideoCapture(device_index, cv2.CAP_V4L2)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._depth_cap = None
+        self._depth_frame: np.ndarray | None = None
+        if depth_index is not None:
+            self._depth_cap = self._init_depth_cap(depth_index, width, height, fps)
+
+    @staticmethod
+    def _init_depth_cap(idx: int, w: int, h: int, fps: int):
+        """Open RealSense depth V4L2 node for raw 16-bit depth reading."""
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # Keep raw 16-bit depth data
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not cap.isOpened():
+            print(f"Depth V4L2: /dev/video{idx} failed to open")
+            cap.release()
+            return None
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            print(f"Depth V4L2: /dev/video{idx} failed to read")
+            cap.release()
+            return None
+        print(f"Depth V4L2: /dev/video{idx} depth ready (shape={frame.shape}, dtype={frame.dtype})")
+        return cap
 
     def read(self):
-        return self.cap.read()
+        ret, frame = self.cap.read()
+        if ret and self._depth_cap is not None:
+            dep_ret, dep_raw = self._depth_cap.read()
+            if dep_ret and dep_raw is not None:
+                try:
+                    if dep_raw.dtype == np.uint16:
+                        self._depth_frame = dep_raw
+                    else:
+                        # Y16 via V4L2: uint8 array with doubled width, reinterpret as uint16 depth (mm)
+                        self._depth_frame = np.ascontiguousarray(dep_raw).view(np.uint16)
+                except Exception:
+                    self._depth_frame = None
+        return ret, frame
+
+    def get_distance_at(self, cx: int, cy: int, radius: int = 2) -> float:
+        """Return median depth in meters at (cx, cy) using a patch of valid pixels."""
+        if self._depth_frame is None:
+            return 0.0
+        h, w = self._depth_frame.shape[:2]
+        patch = self._depth_frame[
+            max(0, cy - radius):min(h, cy + radius + 1),
+            max(0, cx - radius):min(w, cx + radius + 1),
+        ]
+        valid = patch[patch > 0]
+        return round(float(np.median(valid)) / 1000.0, 2) if valid.size > 0 else 0.0
 
     def release(self):
         self.cap.release()
+        if self._depth_cap is not None:
+            self._depth_cap.release()
 
     def isOpened(self) -> bool:
         return self.cap.isOpened()
@@ -70,6 +123,29 @@ def _find_realsense_v4l2_index() -> list[int] | None:
     return sorted_indices
 
 
+def _find_depth_v4l2_index() -> int | None:
+    """Find the RealSense depth V4L2 node index via sysfs device name."""
+    for vdir in sorted(glob.glob('/sys/class/video4linux/video*')):
+        name_file = os.path.join(vdir, 'name')
+        if not os.path.exists(name_file):
+            continue
+        with open(name_file) as f:
+            name = f.read().strip()
+        if 'RealSense' not in name or 'Infrared' in name or 'RGB' in name:
+            continue
+        if 'Depth' not in name:
+            continue
+        parent = os.path.realpath(os.path.join(vdir, 'device'))
+        v4l_dir = os.path.join(parent, 'video4linux')
+        sibling_count = len(os.listdir(v4l_dir)) if os.path.isdir(v4l_dir) else 1
+        if sibling_count < 3:  # Must be in the depth/IR interface group
+            continue
+        idx = int(os.path.basename(vdir).replace('video', ''))
+        print(f"sysfs: RealSense depth node: /dev/video{idx} ({name})")
+        return idx
+    return None
+
+
 def _try_opencv_fallback(width: int, height: int, fps: int):
     """Open the RealSense camera via OpenCV V4L2.
 
@@ -86,8 +162,9 @@ def _try_opencv_fallback(width: int, height: int, fps: int):
         print("Could not locate RealSense V4L2 device")
         return None
 
+    depth_index = _find_depth_v4l2_index()
     for idx in candidates:
-        cam = OpenCVCamera(idx, width, height, fps)
+        cam = OpenCVCamera(idx, depth_index=depth_index, width=width, height=height, fps=fps)
         if not cam.isOpened():
             cam.release()
             continue
@@ -101,7 +178,8 @@ def _try_opencv_fallback(width: int, height: int, fps: int):
             print(f"OpenCV V4L2: /dev/video{idx} looks like depth/IR (ch_diff={ch_diff:.1f}), skipping")
             cam.release()
             continue
-        print(f"OpenCV V4L2: /dev/video{idx} color stream ready ({frame.shape[1]}x{frame.shape[0]})")
+        depth_ok = cam._depth_cap is not None
+        print(f"OpenCV V4L2: /dev/video{idx} color stream ready ({frame.shape[1]}x{frame.shape[0]}) [depth={'ok' if depth_ok else 'unavailable'}]")
         return cam
 
     print("OpenCV V4L2: no RealSense node delivered color frames")
@@ -133,11 +211,18 @@ def _try_realsense_sdk(width: int, height: int, fps: int):
             self.config = rs.config()
             self.align = None
             self.is_opened = False
+            self._last_depth: np.ndarray | None = None
+            self._depth_scale: float = 0.001  # default: 1mm per depth unit
 
         def open(self, w, h, f):
             self.config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, f)
-            self.pipeline.start(self.config)
+            self.config.enable_stream(rs.stream.depth, w, h, rs.format.z16, f)
+            profile = self.pipeline.start(self.config)
             self.align = rs.align(rs.stream.color)
+            try:
+                self._depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+            except Exception:
+                pass  # keep default 0.001
             # Warm up
             for _ in range(30):
                 try:
@@ -155,9 +240,24 @@ def _try_realsense_sdk(width: int, height: int, fps: int):
                 color = aligned.get_color_frame()
                 if not color:
                     return False, None
+                depth = aligned.get_depth_frame()
+                if depth:
+                    self._last_depth = np.asanyarray(depth.get_data())
                 return True, np.asanyarray(color.get_data())
             except Exception:
                 return False, None
+
+        def get_distance_at(self, cx: int, cy: int, radius: int = 2) -> float:
+            """Return median depth in meters at (cx, cy) using aligned depth frame."""
+            if self._last_depth is None:
+                return 0.0
+            h, w = self._last_depth.shape[:2]
+            patch = self._last_depth[
+                max(0, cy - radius):min(h, cy + radius + 1),
+                max(0, cx - radius):min(w, cx + radius + 1),
+            ]
+            valid = patch[patch > 0]
+            return round(float(np.median(valid)) * self._depth_scale, 2) if valid.size > 0 else 0.0
 
         def release(self):
             if self.is_opened:
