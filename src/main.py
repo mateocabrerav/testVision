@@ -61,25 +61,33 @@ def _process_instruction(event):
     try:
         instruction = event.data
         log.info(f"Firebase event received | data: {instruction}")
-        
-        if instruction is None or instruction == "":
+
+        if not instruction:
             log.info("Empty instruction, skipping")
             return
 
-        log.info(f"Firebase 'instruction' changed: {instruction}")
-        
-        # Use Gemini to classify instruction and determine target classes
         api_key = os.getenv('GEMINI_API_KEY')
         if not api_key:
             log.error("GEMINI_API_KEY not found in .env")
             return
-        
-        log.info("Classifying instruction with Gemini...")
+
         target_classes = classify_instruction(api_key, instruction)
         log.info(f"Gemini classified target_classes: {target_classes}")
-        
-        # Wait for camera to produce its first frame (up to 15 s)
-        log.info("Waiting for camera frame...")
+
+        with tracker_lock:
+            if tracker_instance is None:
+                log.warning("Tracker not ready yet")
+                return
+            tracker_instance.target_classes = target_classes
+            tracker_instance.set_instruction(instruction)
+            clip_mode = tracker_instance.clip_active
+            log.info(f"Tracker updated | mode={'CLIP' if clip_mode else 'histogram'} | classes={target_classes}")
+
+        if clip_mode:
+            return  # CLIP needs no training set — done
+
+        # Histogram fallback: generate a training set via Gemini
+        log.info("Waiting for camera frame (histogram fallback)...")
         deadline = time.time() + 15
         while time.time() < deadline:
             with frame_lock:
@@ -87,56 +95,36 @@ def _process_instruction(event):
                     break
             time.sleep(0.2)
         else:
-            log.error("Timed out waiting for camera frame (15s), skipping instruction")
+            log.error("Timed out waiting for camera frame (15s), skipping training set generation")
             return
 
         with frame_lock:
             frame_copy = current_frame.copy()
-        log.info(f"Frame captured | shape={frame_copy.shape}")
-        
-        # Save frame temporarily
+
         temp_image_path = "temp_frame.jpg"
         cv2.imwrite(temp_image_path, frame_copy)
-        
         try:
-            # Attempt initial training set generation -- may find 0 detections, that's OK
-            log.info(f"Generating initial training set | instruction='{instruction}'")
-            output_dir = 'training_set/output'
-            t0 = time.time()
-            try:
-                create_training_set(
-                    api_key=api_key,
-                    input_image_path=temp_image_path,
-                    instruction=instruction,
-                    output_dir=output_dir
-                )
-                elapsed = time.time() - t0
-                log.info(f"create_training_set returned in {elapsed:.1f}s")
-            except Exception as create_err:
-                log.warning(f"create_training_set failed: {create_err} -- will rely on auto-improvement")
-            
-            # Reload tracker and restart auto-improvement regardless of initial result
-            with tracker_lock:
-                if tracker_instance is not None:
-                    tracker_instance.target_classes = target_classes
-                    log.info(f"Updated tracker target_classes: {target_classes}")
-                    
-                    tracker_instance.reload_training_set()
-                    tracker_instance.restart_auto_improvement(instruction=instruction)
-                    log.info(
-                        f"Tracker ready | "
-                        f"initial_images={tracker_instance.training_image_count} | "
-                        f"phase1=Gemini x{tracker_instance.max_gemini_captures} (fires immediately) | "
-                        f"max_images={tracker_instance.max_training_images}"
-                    )
-                else:
-                    log.warning("Tracker not ready yet")
-            
+            create_training_set(
+                api_key=api_key,
+                input_image_path=temp_image_path,
+                instruction=instruction,
+                output_dir='training_set/output',
+            )
+        except Exception as create_err:
+            log.warning(f"create_training_set failed: {create_err} -- will rely on auto-improvement")
         finally:
-            # Clean up temp file
             if os.path.exists(temp_image_path):
                 os.remove(temp_image_path)
-                
+
+        with tracker_lock:
+            if tracker_instance is not None:
+                tracker_instance.reload_training_set()
+                tracker_instance.restart_auto_improvement(instruction=instruction)
+                log.info(
+                    f"Tracker ready | images={tracker_instance.training_image_count} | "
+                    f"max={tracker_instance.max_training_images}"
+                )
+
     except Exception as e:
         log.error(f"Error in _process_instruction: {e}", exc_info=True)
 
@@ -181,7 +169,7 @@ def run_tracker():
                 match_threshold=0.70,
                 device=get_best_device(),
                 img_size=(320, 320),
-                skip_frames=1,
+                skip_frames=2,
                 conf=0.50,
                 auto_improve=True,
                 max_training_images=200,

@@ -6,6 +6,7 @@ by using visual similarity matching against a training set.
 
 from ultralytics import YOLO
 from datetime import datetime
+from typing import Optional
 import os
 import time
 import cv2
@@ -32,32 +33,21 @@ os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
 os.environ['OPENCV_VIDEOIO_PRIORITY_DSHOW'] = '1'
 
 
-def get_best_device():
-    """Auto-detect best available device (CUDA > CPU)."""
+def get_best_device() -> str:
+    """Return best device. Jetson Orin (sm_87) needs JetPack PyTorch for CUDA."""
     try:
         import torch
         if torch.cuda.is_available():
             cap = torch.cuda.get_device_capability()
-            arch_string = f"sm_{cap[0]}{cap[1]}"
+            arch = f"sm_{cap[0]}{cap[1]}"
             arch_list = torch.cuda.get_arch_list()
-            
-            # The Jetson Orin is sm_87. Using generic torch on ARM64 lacks sm_87 support.
-            if arch_list and arch_string not in arch_list and not any(a.startswith("sm_8") for a in arch_list):
-                 # Fallback if no Ampere architecture is matched (actually sm_86/80 might run or not, let's just use try)
-                 pass
-            
-            # A more robust check: YOLO will crash if PyTorch compiled arches don't have sm_87
-            if "sm_87" not in arch_list and arch_string == "sm_87":
-                log.warning(f"PyTorch lacks {arch_string} support (Jetson Orin). Falling back to CPU.")
+            if arch not in arch_list:
+                log.warning(f"PyTorch lacks {arch} kernel (have {arch_list}). Using CPU.")
                 return 'cpu'
-
-            device = 'cuda:0'
-            gpu_name = torch.cuda.get_device_name(0)
-            log.info(f"Using GPU: {gpu_name}")
-            return device
-    except:
+            log.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            return 'cuda:0'
+    except Exception:
         pass
-    
     log.info("Using CPU")
     return 'cpu'
 class SelectivePersonTracker:
@@ -82,7 +72,8 @@ class SelectivePersonTracker:
         auto_improve: bool = False,
         max_training_images: int = 200,
         improvement_interval: int = 10,  # seconds
-        target_classes: list = None  # None = all classes, [0] = person only, etc.
+        target_classes: list = None,  # None = all classes, [0] = person only, etc.
+        use_clip: bool = True
     ):
         self.model = YOLO(model_path)
         self.result_dir = result_dir
@@ -110,12 +101,22 @@ class SelectivePersonTracker:
         self.max_gemini_captures = 4  # Use Gemini for first 4 captures
         self.current_instruction = None  # Store current tracking instruction
         self.is_improving = False  # Flag for async improvement
-        
+
+        # CLIP zero-shot matcher (no training set needed)
+        self._clip: Optional['ClipMatcher'] = None
+        if use_clip:
+            try:
+                from .clip_matcher import ClipMatcher
+                self._clip = ClipMatcher(device='cpu')
+                log.info("CLIP matcher loaded — zero-shot mode active")
+            except Exception as e:
+                log.warning(f"CLIP unavailable, falling back to HSV histograms: {e}")
+
         # Load reference features from training set
         self.reference_features = self._load_training_set_features(training_set_dir)
         self.training_image_count = len(self.reference_features)
         log.info(f"Loaded {self.training_image_count} reference images from training set")
-    
+
     def reload_training_set(self):
         """Reload training set features and clear cache."""
         log.info("Reloading training set...")
@@ -123,7 +124,25 @@ class SelectivePersonTracker:
         self.training_image_count = len(self.reference_features)
         self.feature_cache.clear()
         log.info(f"Reloaded {self.training_image_count} reference images | mean_ref={'yes' if self.mean_reference is not None else 'no'}")
-    
+
+    @property
+    def clip_active(self) -> bool:
+        """True when CLIP is loaded and has an instruction set."""
+        return self._clip is not None and self._clip.active
+
+    def set_instruction(self, instruction: str) -> None:
+        """Update tracking target via natural language description.
+
+        Uses CLIP for zero-shot matching when available; otherwise falls
+        back to HSV histograms (requires a training set).
+        """
+        self.current_instruction = instruction
+        if self._clip is not None:
+            self._clip.set_instruction(instruction)
+            self.auto_improve = False  # CLIP doesn't need a training set
+            self.feature_cache.clear()
+            log.info(f"CLIP instruction set: '{instruction}'")
+
     def restart_auto_improvement(self, instruction: str = None):
         """Restart auto-improvement process from scratch."""
         import time
@@ -298,7 +317,10 @@ class SelectivePersonTracker:
         return np.concatenate(parts)
 
     def _matches_training_set(self, person_crop: np.ndarray, track_id: int = None) -> float:
-        """Two-stage matching: quick-reject via mean reference, then full comparison."""
+        """Two-stage matching: CLIP zero-shot (preferred) or HSV histogram fallback."""
+        if self.clip_active:
+            return self._clip.score(person_crop, track_id)
+
         if len(self.reference_features) == 0:
             return 0.0
 
@@ -618,11 +640,6 @@ class SelectivePersonTracker:
 
                     # Skip frames for performance
                     if frame_idx % self.skip_frames != 0:
-                        if show:
-                            display_frame = last_annotated_frame if last_annotated_frame is not None else frame
-                            cv2.imshow("Selective Object Tracker", display_frame)
-                            if cv2.waitKey(1) & 0xFF == ord('q'):
-                                break
                         frame_idx += 1
                         continue
 
@@ -824,11 +841,10 @@ class SelectivePersonTracker:
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
                     depth_viz = self._make_depth_viz(frame, detected_objects)
-                    combined = np.hstack([frame, depth_viz])
-                    last_annotated_frame = combined
+                    last_annotated_frame = depth_viz
 
                     if show:
-                        cv2.imshow("Selective Object Tracker", combined)
+                        cv2.imshow("Selective Object Tracker", depth_viz)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             break
 
@@ -849,50 +865,20 @@ class SelectivePersonTracker:
             log.info(summary)
     
     def _make_depth_viz(self, frame: np.ndarray, detected_objects: list) -> np.ndarray:
-        """Full-frame depth heat map: JET base from grayscale + distance-colored boxes."""
-        MAX_DIST = 8.0  # metres
-        h, w = frame.shape[:2]
+        """Lightweight depth overlay: draw distance-colored boxes on the original frame."""
+        MAX_DIST = 8.0
+        viz = frame  # draw in-place, no copy needed
 
-        # Build a per-pixel depth map (uint8 0-255); default = far (0 = dark blue in JET)
-        depth_map = np.zeros((h, w), dtype=np.uint8)
-        for obj in detected_objects:
-            x1, y1, x2, y2 = obj['box']
-            d = obj.get('distance_m', 0.0)
-            # Close = 255 (red/yellow), far = 0 (blue); cap at MAX_DIST
-            val = int(max(0.0, 1.0 - d / MAX_DIST) * 255) if d > 0 else 0
-            depth_map[y1:y2, x1:x2] = val
-
-        # Apply JET colormap → full color heat map
-        heat = cv2.applyColorMap(depth_map, cv2.COLORMAP_JET)
-
-        # Blend with dimmed grayscale so the scene is still recognisable
-        gray_bgr = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-        viz = cv2.addWeighted(heat, 0.75, gray_bgr, 0.25, 0)
-
-        # Distance label centred inside each detected box
         for obj in detected_objects:
             x1, y1, x2, y2 = obj['box']
             d = obj.get('distance_m', 0.0)
             if d <= 0:
                 continue
-            txt = f"{d:.1f}m"
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-            tx = (x1 + x2) // 2 - tw // 2
-            ty = (y1 + y2) // 2 + th // 2
-            cv2.putText(viz, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
-            cv2.putText(viz, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            # Near = green, far = blue
+            t = min(d / MAX_DIST, 1.0)
+            color = (int(255 * t), int(255 * (1 - t)), 0)
+            cv2.rectangle(viz, (x1, y1), (x2, y2), color, 1)
 
-        # Colorbar legend (right side, 20 px wide)
-        bar_w, bar_x = 20, w - 25
-        for row in range(h):
-            t = row / h  # 0=top=far=blue, 1=bottom=close=red
-            val = np.array([[[int((1 - t) * 255)]]], dtype=np.uint8)
-            color = tuple(int(c) for c in cv2.applyColorMap(val, cv2.COLORMAP_JET)[0, 0])
-            cv2.line(viz, (bar_x, row), (bar_x + bar_w, row), color, 1)
-        cv2.putText(viz, "0m", (bar_x - 2, h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(viz, f"{int(MAX_DIST)}m", (bar_x - 2, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-        cv2.putText(viz, "Depth map (est.)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return viz
 
     def _async_improve(self, frame, instruction, best_match_crop):
